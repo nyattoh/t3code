@@ -417,6 +417,8 @@ import {
 } from "../state/entities";
 import { environmentShell } from "../state/shell";
 import { ChatComposer, type ChatComposerHandle } from "./chat/ChatComposer";
+import { JevRoutingControls, type JevRoutingConfiguration } from "./chat/JevRoutingControls";
+import { createJevSendGuard } from "@t3tools/client-runtime/operations";
 import { createPageScrollController, type PageScrollKey } from "./chat/pageScrollController";
 import { isTimelineScrollTarget } from "./chat/timelineScrollTarget";
 import { DraftHeroHeadline } from "./chat/DraftHeroHeadline";
@@ -1564,6 +1566,52 @@ export default function ChatView(props: ChatViewProps) {
     reportFailure: false,
   });
   const startThreadTurn = useAtomCommand(threadEnvironment.startTurn, { reportFailure: false });
+  const selectJevModelRoute = useAtomCommand(threadEnvironment.selectModelRoute, {
+    reportFailure: false,
+  });
+  const defaultJevConfiguration: JevRoutingConfiguration = {
+    enabled: false,
+    taskSummary: "",
+    policy: "",
+  };
+  const [jevConfigurationState, setJevConfigurationState] = useState({
+    threadKey: routeThreadKey,
+    configuration: defaultJevConfiguration,
+  });
+  const jevConfiguration =
+    jevConfigurationState.threadKey === routeThreadKey
+      ? jevConfigurationState.configuration
+      : defaultJevConfiguration;
+  const setJevConfiguration = (
+    next: JevRoutingConfiguration | ((current: JevRoutingConfiguration) => JevRoutingConfiguration),
+  ) =>
+    setJevConfigurationState((current) => ({
+      threadKey: routeThreadKey,
+      configuration:
+        typeof next === "function"
+          ? next(
+              current.threadKey === routeThreadKey
+                ? current.configuration
+                : defaultJevConfiguration,
+            )
+          : next,
+    }));
+  const [jevSelecting, setJevSelecting] = useState(false);
+  const [jevSendPending, setJevSendPending] = useState(false);
+  const [jevDispatching, setJevDispatching] = useState(false);
+  const jevActiveSendRef = useRef<ReturnType<typeof createJevSendGuard> | null>(null);
+  const [jevSelectionResultState, setJevSelectionResultState] = useState<{
+    threadKey: string;
+    result: string | null;
+  }>({ threadKey: routeThreadKey, result: null });
+  const jevSelectionResult =
+    jevSelectionResultState.threadKey === routeThreadKey ? jevSelectionResultState.result : null;
+  const setJevSelectionResult = (result: string | null) =>
+    setJevSelectionResultState({ threadKey: routeThreadKey, result });
+  const jevSelectionGenerationRef = useRef(0);
+  useEffect(() => {
+    jevSelectionGenerationRef.current++;
+  }, [routeThreadKey]);
   const resumeThreadQueue = useAtomCommand(threadEnvironment.resumeThreadQueue, {
     reportFailure: false,
   });
@@ -8941,6 +8989,117 @@ export default function ChatView(props: ChatViewProps) {
       setThreadError(threadIdForSend, attachmentCapabilitiesBeforeUpload.fileBlockReason);
       return;
     }
+    let routedModelSelection = ctxSelectedModelSelection;
+    let routingCommandId: CommandId | null = null;
+    let jevDecisionId: string | undefined;
+    let jevDraftCleared = false;
+    let jevSendGuard: ReturnType<typeof createJevSendGuard> | undefined;
+    const stopIfStaleJevSend = () => {
+      if (!jevSendGuard || jevSendGuard.isCurrent()) return false;
+      sendInFlightRef.current = false;
+      setJevSendPending(false);
+      resetLocalDispatch();
+      setOptimisticUserMessages((messages) =>
+        messages.filter((message) => message.id !== messageIdForSend),
+      );
+      return true;
+    };
+    if (jevConfiguration.enabled) {
+      if (
+        ctxSelectedProvider !== "codex" ||
+        multipleModelSelections !== null ||
+        shouldQueueBehindActiveRun ||
+        phase === "running" ||
+        compactBeforeSend ||
+        serverProjection?.runs.some((run) =>
+          ["preparing", "starting", "running", "waiting"].includes(run.status),
+        ) ||
+        dispatchMode !== "auto" ||
+        (isServerThread &&
+          activeThread.modelSelection.instanceId !== ctxSelectedModelSelection.instanceId)
+      ) {
+        sendInFlightRef.current = false;
+        setJevSendPending(false);
+        setThreadError(
+          threadIdForSend,
+          "Jev selection requires an idle turn on the same Codex account. Use manual selection for this action.",
+        );
+        return;
+      }
+      ++jevSelectionGenerationRef.current;
+      jevSendGuard = createJevSendGuard(() => {
+        const draft = useComposerDraftStore.getState().getComposerDraft(composerDraftTarget);
+        return {
+          threadKey: currentRouteThreadKeyRef.current,
+          generation: jevSelectionGenerationRef.current,
+          fingerprint: JSON.stringify({
+            prompt: draft?.prompt,
+            attachments: [...(draft?.images ?? []), ...(draft?.files ?? [])].map((item) => item.id),
+            terminalContexts: draft?.terminalContexts,
+            previewAnnotations: draft?.previewAnnotations,
+            reviewComments: draft?.reviewComments,
+            threadContexts: draft?.threadContexts,
+            selection: composerRef.current?.getSendContext()?.selectedModelSelection,
+            activeProvider: draft?.activeProvider,
+          }),
+        };
+      });
+      setJevSendPending(true);
+      setJevDispatching(false);
+      jevActiveSendRef.current = jevSendGuard;
+      routingCommandId = CommandId.make(randomUUID());
+      setJevSelecting(true);
+      setJevSelectionResult(null);
+      try {
+        const selectionResult = await selectJevModelRoute({
+          environmentId,
+          input: {
+            requestId: routingCommandId,
+            mode: "jev",
+            baseline: ctxSelectedModelSelection,
+            taskSummary: jevConfiguration.taskSummary,
+            policy: jevConfiguration.policy,
+          },
+        });
+        if (stopIfStaleJevSend()) return;
+        if (selectionResult._tag === "Failure") {
+          sendInFlightRef.current = false;
+          setJevSendPending(false);
+          setThreadError(
+            threadIdForSend,
+            chatActionErrorMessage(squashAtomCommandFailure(selectionResult)),
+          );
+          return;
+        }
+        if (!selectionResult.value.decisionId) {
+          sendInFlightRef.current = false;
+          setJevSendPending(false);
+          setThreadError(
+            threadIdForSend,
+            "Server did not bind the Jev decision. No turn was sent.",
+          );
+          return;
+        }
+        jevDecisionId = selectionResult.value.decisionId;
+        routedModelSelection = selectionResult.value.selection;
+        const effort = routedModelSelection.options?.find(
+          (option) => option.id === "reasoningEffort",
+        )?.value;
+        setJevSelectionResult(
+          `${routedModelSelection.model} / ${effort ?? "default"}. ${selectionResult.value.reason}`,
+        );
+      } catch {
+        sendInFlightRef.current = false;
+        setJevSendPending(false);
+        setThreadError(
+          threadIdForSend,
+          "Jev selection failed. Your draft is unchanged; choose a model manually.",
+        );
+        return;
+      } finally {
+        setJevSelecting(false);
+      }
+    }
     const turnUsesAttachmentUploads =
       composerFilesSnapshot.length > 0
         ? attachmentCapabilitiesBeforeUpload.supportsAttachmentUploads
@@ -8954,14 +9113,17 @@ export default function ChatView(props: ChatViewProps) {
         });
       }
       await awaitAttachmentUploads(composerAttachmentsSnapshot.map((attachment) => attachment.id));
+      if (stopIfStaleJevSend()) return;
       const attachmentCapabilitiesAfterUpload = readLiveAttachmentCapabilities();
       if (attachmentCapabilitiesAfterUpload.fileBlockReason !== null) {
         sendInFlightRef.current = false;
+        setJevSendPending(false);
         setThreadError(threadIdForSend, attachmentCapabilitiesAfterUpload.fileBlockReason);
         return;
       }
       if (getUploadedAttachments({ environmentId, images: composerAttachmentsSnapshot }) === null) {
         sendInFlightRef.current = false;
+        setJevSendPending(false);
         setThreadError(threadIdForSend, "Retry or remove failed uploads before sending.");
         return;
       }
@@ -8991,6 +9153,7 @@ export default function ChatView(props: ChatViewProps) {
       );
       void dockTransition.catch(() => resolveDockStarted?.());
       await dockStarted;
+      if (stopIfStaleJevSend()) return;
     }
     beginLocalDispatch({
       preparingWorktree: multipleModelSelections !== null || Boolean(baseBranchForWorktree),
@@ -9198,6 +9361,7 @@ export default function ChatView(props: ChatViewProps) {
         // Each request now owns its background thread. The original draft is
         // ready for another prompt while checkout and setup scripts finish.
         sendInFlightRef.current = false;
+        setJevSendPending(false);
         resetLocalDispatch();
         releasedComposer = true;
         await starts;
@@ -9287,6 +9451,7 @@ export default function ChatView(props: ChatViewProps) {
         }
         if (!releasedComposer) {
           sendInFlightRef.current = false;
+          setJevSendPending(false);
           resetLocalDispatch();
         }
       }
@@ -9363,9 +9528,12 @@ export default function ChatView(props: ChatViewProps) {
         }),
       );
     }
-    promptRef.current = "";
-    clearComposerDraftContent(composerDraftTarget);
-    composerRef.current?.resetCursorState();
+    if (stopIfStaleJevSend()) return;
+    if (!jevSendGuard) {
+      promptRef.current = "";
+      clearComposerDraftContent(composerDraftTarget);
+      composerRef.current?.resetCursorState();
+    }
 
     let firstComposerImageName: string | null = null;
     if (composerImagesSnapshot.length > 0) {
@@ -9392,9 +9560,9 @@ export default function ChatView(props: ChatViewProps) {
     }
     const title = truncate(titleSeed);
     const threadCreateModelSelection = createModelSelection(
-      ctxSelectedModelSelection.instanceId,
-      ctxSelectedModel || activeProjectDefaultModelSelection?.model || DEFAULT_MODEL,
-      ctxSelectedModelSelection.options,
+      routedModelSelection.instanceId,
+      routedModelSelection.model || activeProjectDefaultModelSelection?.model || DEFAULT_MODEL,
+      routedModelSelection.options,
     );
 
     let failure: AtomCommandResult<unknown, unknown> | null = null;
@@ -9409,6 +9577,7 @@ export default function ChatView(props: ChatViewProps) {
         runtimeMode,
         interactionMode: sendInteractionMode,
       });
+      if (stopIfStaleJevSend()) return;
       if (settingsResult._tag === "Failure") {
         failure = settingsResult;
       }
@@ -9422,6 +9591,7 @@ export default function ChatView(props: ChatViewProps) {
       }
       return turnAttachments;
     });
+    if (stopIfStaleJevSend()) return;
     if (failure === null && turnAttachmentsResult._tag === "Failure") {
       failure = turnAttachmentsResult;
     }
@@ -9432,7 +9602,7 @@ export default function ChatView(props: ChatViewProps) {
         input: {
           threadId: threadIdForSend,
           message: { messageId: newMessageId(), role: "user", text: "/compact", attachments: [] },
-          modelSelection: ctxSelectedModelSelection,
+          modelSelection: routedModelSelection,
           runtimeMode,
           interactionMode: sendInteractionMode,
         },
@@ -9479,9 +9649,55 @@ export default function ChatView(props: ChatViewProps) {
           ? scopeThreadRef(environmentId, threadIdForSend)
           : null;
       if (backgroundThreadRef) beginBackgroundDraftSubmissionByRef(backgroundThreadRef);
+      if (stopIfStaleJevSend()) return;
+      const openBackgroundDraft = async () => {
+        if (backgroundThreadRef) {
+          markPromotedDraftThreadByRef(backgroundThreadRef);
+          if (currentRouteThreadKeyRef.current !== routeThreadKey) return;
+          try {
+            backgroundDraftOpened = Boolean(
+              await handleNewThread(
+                scopeProjectRef(activeProject.environmentId, activeProject.id),
+                resolveBackgroundDraftWorkspaceOptions({
+                  envMode: sendEnvMode,
+                  branch: activeThreadBranch,
+                  startFromOrigin,
+                }),
+              ),
+            );
+          } catch (error) {
+            clearBackgroundDraftSubmissionByRef(backgroundThreadRef);
+            toastManager.add(
+              stackedThreadToast({
+                type: "warning",
+                title: "Could not open a fresh composer",
+                description: error instanceof Error ? error.message : undefined,
+              }),
+            );
+          }
+        }
+      };
       const startPromise = startThreadTurn({
         environmentId,
         input: {
+          ...(routingCommandId ? { commandId: routingCommandId } : {}),
+          ...(jevDecisionId
+            ? {
+                jevDecisionId,
+                isSubmissionCurrent: jevSendGuard!.isCurrent,
+                onSubmissionDispatched: () => {
+                  jevSendGuard!.markDispatched();
+                  setJevDispatching(true);
+                },
+                prepareSubmission: () =>
+                  jevSendGuard!.clearDraft(() => {
+                    jevDraftCleared = true;
+                    promptRef.current = "";
+                    clearComposerDraftContent(composerDraftTarget);
+                    composerRef.current?.resetCursorState();
+                  }),
+              }
+            : {}),
           threadId: threadIdForSend,
           message: {
             messageId: messageIdForSend,
@@ -9515,44 +9731,23 @@ export default function ChatView(props: ChatViewProps) {
               return { context };
             })(),
           },
-          modelSelection: ctxSelectedModelSelection,
+          modelSelection: routedModelSelection,
           titleSeed: title,
           runtimeMode,
           interactionMode: sendInteractionMode,
-          dispatchMode: turnDispatchMode,
+          dispatchMode: routingCommandId ? "start" : turnDispatchMode,
           ...(bootstrap ? { bootstrap } : {}),
           createdAt: messageCreatedAt,
         },
       });
-      if (backgroundThreadRef) {
-        markPromotedDraftThreadByRef(backgroundThreadRef);
-        try {
-          backgroundDraftOpened = Boolean(
-            await handleNewThread(
-              scopeProjectRef(activeProject.environmentId, activeProject.id),
-              resolveBackgroundDraftWorkspaceOptions({
-                envMode: sendEnvMode,
-                branch: activeThreadBranch,
-                startFromOrigin,
-              }),
-            ),
-          );
-        } catch (error) {
-          clearBackgroundDraftSubmissionByRef(backgroundThreadRef);
-          toastManager.add(
-            stackedThreadToast({
-              type: "warning",
-              title: "Could not open a fresh composer",
-              description: error instanceof Error ? error.message : undefined,
-            }),
-          );
-        }
-      }
+      if (!jevDecisionId) await openBackgroundDraft();
       const startResult = await startPromise;
       if (startResult._tag === "Failure") {
         failure = startResult;
       } else {
         turnStartSucceeded = true;
+        if (jevDecisionId) await openBackgroundDraft();
+
         // The turn is under way and will spend quota, so that thread's limits
         // snapshot is stale. Uploads may have outlasted a navigation, so only
         // the sending thread's panel clears.
@@ -9606,47 +9801,57 @@ export default function ChatView(props: ChatViewProps) {
         );
         clearBackgroundDraftSubmissionByRef(scopeThreadRef(environmentId, threadIdForSend));
       }
-      if (
-        backgroundDraftOpened
-          ? !composerDraftHasUserContent(
-              useComposerDraftStore.getState().getComposerDraft(composerDraftTarget),
-            )
-          : promptRef.current.length === 0 &&
-            composerImagesRef.current.length === 0 &&
-            composerFilesRef.current.length === 0 &&
-            composerTerminalContextsRef.current.length === 0 &&
-            (useComposerDraftStore.getState().getComposerDraft(composerDraftTarget)
-              ?.previewAnnotations.length ?? 0) === 0 &&
-            (useComposerDraftStore.getState().getComposerDraft(composerDraftTarget)?.reviewComments
-              .length ?? 0) === 0 &&
-            (useComposerDraftStore.getState().getComposerDraft(composerDraftTarget)?.threadContexts
-              .length ?? 0) === 0
-      ) {
-        setOptimisticUserMessages((existing) => {
-          const removed = existing.filter((message) => message.id === messageIdForSend);
-          for (const message of removed) {
-            revokeUserMessagePreviewUrls(message);
-          }
-          const next = existing.filter((message) => message.id !== messageIdForSend);
-          return next.length === existing.length ? existing : next;
-        });
-        promptRef.current = messageTextForSend;
-        const retryComposerImages = composerImagesSnapshot.map(cloneComposerImageForRetry);
-        composerImagesRef.current = retryComposerImages;
-        composerFilesRef.current = composerFilesSnapshot;
-        composerTerminalContextsRef.current = composerTerminalContextsSnapshot;
-        setComposerDraftPrompt(composerDraftTarget, messageTextForSend);
-        addComposerDraftImages(composerDraftTarget, retryComposerImages);
-        addComposerDraftFiles(composerDraftTarget, composerFilesSnapshot);
-        setComposerDraftTerminalContexts(composerDraftTarget, composerTerminalContextsSnapshot);
-        setComposerDraftPreviewAnnotations(composerDraftTarget, composerPreviewAnnotationsSnapshot);
-        setComposerDraftReviewComments(composerDraftTarget, composerReviewCommentsSnapshot);
-        setComposerDraftThreadContexts(composerDraftTarget, composerThreadContextsSnapshot);
-        composerRef.current?.resetCursorState({
-          cursor: collapseExpandedComposerCursor(messageTextForSend, messageTextForSend.length),
-          prompt: messageTextForSend,
-          detectTrigger: true,
-        });
+      if (!jevSendGuard || (jevDraftCleared && jevSendGuard.isCurrent())) {
+        if (
+          backgroundDraftOpened
+            ? !composerDraftHasUserContent(
+                useComposerDraftStore.getState().getComposerDraft(composerDraftTarget),
+              )
+            : promptRef.current.length === 0 &&
+              composerImagesRef.current.length === 0 &&
+              composerFilesRef.current.length === 0 &&
+              composerTerminalContextsRef.current.length === 0 &&
+              (useComposerDraftStore.getState().getComposerDraft(composerDraftTarget)
+                ?.previewAnnotations.length ?? 0) === 0 &&
+              (useComposerDraftStore.getState().getComposerDraft(composerDraftTarget)
+                ?.reviewComments.length ?? 0) === 0 &&
+              (useComposerDraftStore.getState().getComposerDraft(composerDraftTarget)
+                ?.threadContexts.length ?? 0) === 0
+        ) {
+          setOptimisticUserMessages((existing) => {
+            const removed = existing.filter((message) => message.id === messageIdForSend);
+            for (const message of removed) {
+              revokeUserMessagePreviewUrls(message);
+            }
+            const next = existing.filter((message) => message.id !== messageIdForSend);
+            return next.length === existing.length ? existing : next;
+          });
+          promptRef.current = messageTextForSend;
+          const retryComposerImages = composerImagesSnapshot.map(cloneComposerImageForRetry);
+          composerImagesRef.current = retryComposerImages;
+          composerFilesRef.current = composerFilesSnapshot;
+          composerTerminalContextsRef.current = composerTerminalContextsSnapshot;
+          setComposerDraftPrompt(composerDraftTarget, messageTextForSend);
+          addComposerDraftImages(composerDraftTarget, retryComposerImages);
+          addComposerDraftFiles(composerDraftTarget, composerFilesSnapshot);
+          setComposerDraftTerminalContexts(composerDraftTarget, composerTerminalContextsSnapshot);
+          setComposerDraftPreviewAnnotations(
+            composerDraftTarget,
+            composerPreviewAnnotationsSnapshot,
+          );
+          setComposerDraftReviewComments(composerDraftTarget, composerReviewCommentsSnapshot);
+          setComposerDraftThreadContexts(composerDraftTarget, composerThreadContextsSnapshot);
+          composerRef.current?.resetCursorState({
+            cursor: collapseExpandedComposerCursor(messageTextForSend, messageTextForSend.length),
+            prompt: messageTextForSend,
+            detectTrigger: true,
+          });
+        }
+      }
+      if (jevSendGuard && !jevSendGuard.isCurrent()) {
+        setOptimisticUserMessages((messages) =>
+          messages.filter((message) => message.id !== messageIdForSend),
+        );
       }
       if (!isAtomCommandInterrupted(failure)) {
         const error = squashAtomCommandFailure(failure);
@@ -9672,6 +9877,7 @@ export default function ChatView(props: ChatViewProps) {
       }
     }
     sendInFlightRef.current = false;
+    setJevSendPending(false);
     if (!turnStartSucceeded) {
       setDockedDraftHeroThreadKey((currentThreadKey) =>
         currentThreadKey === activeThreadKey ? null : currentThreadKey,
@@ -11129,6 +11335,30 @@ export default function ChatView(props: ChatViewProps) {
                               }
                             />
                           ) : null}
+                          {!composerMounted ||
+                          serverConfig?.environment.capabilities.jevRouting !== true ? null : (
+                            <JevRoutingControls
+                              configuration={jevConfiguration}
+                              selecting={jevSelecting || jevSendPending}
+                              dispatched={jevDispatching}
+                              canCancel={jevSendPending && !jevDispatching}
+                              result={jevSelectionResult}
+                              onChange={(configuration) => {
+                                jevSelectionGenerationRef.current++;
+                                setJevConfiguration(configuration);
+                                setJevSelectionResult(null);
+                              }}
+                              onCancel={() => {
+                                if (!jevActiveSendRef.current?.canCancel()) return;
+                                jevSelectionGenerationRef.current++;
+                                setJevConfiguration((configuration) => ({
+                                  ...configuration,
+                                  enabled: false,
+                                }));
+                                setJevSelectionResult("Selection cancelled. No turn will be sent.");
+                              }}
+                            />
+                          )}
                           {!composerMounted ? null : (
                             <ChatComposer
                               reportedModelSelection={reportedModelSelection}
@@ -11164,7 +11394,10 @@ export default function ChatView(props: ChatViewProps) {
                               phase={phase}
                               canInterrupt={canInterruptRunningThread}
                               isConnecting={isConnecting}
-                              isSendBusy={isSendBusy || isSavingQueuedEdit || isResuming}
+                              isSendBusy={
+                                isSendBusy || jevSendPending || isSavingQueuedEdit || isResuming
+                              }
+                              submissionLocked={jevSendPending}
                               canResume={resumableRunId !== null || hasHeldQueuedRuns}
                               isRevertingCheckpoint={isRevertingCheckpoint}
                               sendDisabledReason={

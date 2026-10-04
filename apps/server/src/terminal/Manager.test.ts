@@ -2358,6 +2358,60 @@ it.layer(
     }).pipe(Effect.provide(ServerSettings.ServerSettingsService.layerTest())),
   );
 
+  it.effect.each([false, true])("scrubs Jev keys at PTY spawn with provider=%s", (withProvider) =>
+    Effect.gen(function* () {
+      const path = yield* Path.Path;
+      const serverSettings = yield* ServerSettings.ServerSettingsService;
+      const baseEnv = {
+        TYPESAFE_API_KEY: "fake-upper",
+        typesafe_api_key: "fake-lower",
+        KEEP: "base",
+      };
+      const { manager, ptyAdapter } = yield* createManager(5, {
+        env: baseEnv,
+        resolveProviderInstanceEnvironment: (rawProviderInstanceId, env) =>
+          TerminalManager.resolveProviderInstanceTerminalEnvironment({
+            serverSettings,
+            path,
+            rawProviderInstanceId,
+            env,
+          }),
+      });
+      const input = openInput({
+        ...(withProvider ? { providerInstanceId: ProviderInstanceId.make("jev_terminal") } : {}),
+        env: {
+          TYPESAFE_API_KEY: "fake-client-upper",
+          typesafe_api_key: "fake-client-lower",
+          KEEP: "runtime",
+        },
+      });
+      yield* manager.open(input);
+      yield* manager.restart(restartInput({ ...input, cols: 100, rows: 24 }));
+      expect(ptyAdapter.spawnInputs).toHaveLength(2);
+      for (const spawn of ptyAdapter.spawnInputs) {
+        expect(
+          Object.keys(spawn.env).filter((key) => key.toUpperCase() === "TYPESAFE_API_KEY"),
+        ).toEqual([]);
+        expect(spawn.env.KEEP).toBe("runtime");
+      }
+      expect(baseEnv.TYPESAFE_API_KEY).toBe("fake-upper");
+      expect(baseEnv.typesafe_api_key).toBe("fake-lower");
+    }).pipe(
+      Effect.provide(
+        ServerSettings.layerTest({
+          providerInstances: {
+            [ProviderInstanceId.make("jev_terminal")]: {
+              driver: "codex",
+              environment: [
+                { name: "Typesafe_Api_Key", value: "fake-configured", sensitive: true },
+              ],
+            },
+          },
+        }),
+      ),
+    ),
+  );
+
   it.effect("restarts a running terminal when the resolved provider environment changes", () =>
     Effect.gen(function* () {
       const providerInstanceId = ProviderInstanceId.make("codex_work");

@@ -25,6 +25,26 @@ T3 Code can use your installed Codex and its existing login. Run `codex login`
 on the environment's machine to sign in. [Provider setup](./install.md#providers)
 covers installation and custom configuration.
 
+## Choose a model with Jev
+
+On web and desktop, switch **Manual model** to **Jev automatic** above the composer.
+Enter a short task summary and your selection preference, then send an idle turn.
+Jev chooses a supported model and reasoning effort within the selected Codex account.
+Other model options and permission settings remain as you configured them.
+
+The summary and preference are sent to TypeSafe. Each automatic send requests one
+Jev decision. Cancel is available during selection and preparation and prevents the
+coding turn; an accepted decision request may still be billed. Once the turn is
+submitted, Cancel disappears and the UI waits for the server response. Background
+sends open a fresh draft after acceptance. Keep credentials and private code out of
+the summary.
+
+The server process needs `TYPESAFE_API_KEY` in its environment. The key stays on
+the server and is withheld from coding-agent child processes. Missing credentials,
+an unavailable choice, or a selection failure stops sending and keeps your draft.
+Switch back to **Manual model** to choose explicitly. Mobile keeps its existing
+manual model controls.
+
 ## Use multiple accounts
 
 Add another ChatGPT account in **Settings → Providers**, then select the account

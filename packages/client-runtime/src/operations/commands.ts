@@ -10,6 +10,8 @@ import {
   type ChatAttachment,
   type MessageId,
   type ModelSelection,
+  type JevRouteInput,
+  JevSelectionError,
   type OrchestrationV2Command,
   type OrchestrationV2CreationSource,
   type PlanId,
@@ -163,6 +165,13 @@ interface StartThreadBootstrap {
 }
 
 export interface StartThreadTurnInput extends ThreadCommandInput {
+  readonly jevDecisionId?: string;
+  /** Local-only guard, checked after preparation awaits and before either RPC. */
+  readonly isSubmissionCurrent?: () => boolean;
+  /** Clears the original draft only at the final dispatch boundary. Never serialized. */
+  readonly prepareSubmission?: () => boolean;
+  /** Local notification at the final boundary; cancellation is no longer offered. */
+  readonly onSubmissionDispatched?: () => void;
   readonly manualContinuationOfRunId?: RunId;
   readonly message: {
     readonly messageId: MessageId;
@@ -622,15 +631,52 @@ export const setThreadInteractionMode = Effect.fn("EnvironmentCommands.setThread
   },
 );
 
+export const selectModelRoute = Effect.fn("EnvironmentCommands.selectModelRoute")(function* (
+  input: JevRouteInput,
+) {
+  return yield* request(WS_METHODS.serverSelectModelRoute, input);
+});
+
 export const startThreadTurn = Effect.fn("EnvironmentCommands.startThreadTurn")(function* (
   input: StartThreadTurnInput,
 ) {
+  const checkSubmission = () =>
+    input.isSubmissionCurrent?.() === false
+      ? Effect.fail(
+          new JevSelectionError({
+            code: "cancelled",
+            detail: "Submission changed. No turn was sent.",
+          }),
+        )
+      : Effect.void;
+  const prepareSubmission = Effect.gen(function* () {
+    yield* checkSubmission();
+    if (input.prepareSubmission?.() === false) {
+      return yield* Effect.fail(
+        new JevSelectionError({
+          code: "cancelled",
+          detail: "Submission changed. No turn was sent.",
+        }),
+      );
+    }
+    yield* checkSubmission();
+  });
+  yield* checkSubmission();
+  if (input.jevDecisionId !== undefined && input.dispatchMode !== "start") {
+    return yield* Effect.fail(
+      new JevSelectionError({
+        code: "invalid-selection",
+        detail: "Jev decisions require an immediate start.",
+      }),
+    );
+  }
   const commandId = yield* allocateCommandId(input);
   const attachments = yield* persistAttachments(
     input.threadId,
     input.message.messageId,
     input.message.attachments,
   );
+  yield* checkSubmission();
   const context = remapComposerContextAttachments(
     input.message.context,
     input.message.attachments,
@@ -642,6 +688,7 @@ export const startThreadTurn = Effect.fn("EnvironmentCommands.startThreadTurn")(
     const existingProjection =
       bootstrap === undefined ? yield* getProjection(input.threadId) : null;
     const thread = bootstrap ?? existingProjection!.thread;
+    yield* checkSubmission();
     const workspaceStrategy =
       prepareWorktree !== undefined
         ? {
@@ -664,8 +711,11 @@ export const startThreadTurn = Effect.fn("EnvironmentCommands.startThreadTurn")(
                 ? {}
                 : { branch: bootstrap.branch }),
             };
+    yield* prepareSubmission;
+    input.onSubmissionDispatched?.();
     return yield* request(ORCHESTRATION_V2_WS_METHODS.launchThread, {
       commandId,
+      ...(input.jevDecisionId === undefined ? {} : { jevDecisionId: input.jevDecisionId }),
       creationSource: input.creationSource ?? "web",
       threadId: input.threadId,
       ...(bootstrap === undefined ? { reuseExistingThread: true } : {}),
@@ -687,8 +737,11 @@ export const startThreadTurn = Effect.fn("EnvironmentCommands.startThreadTurn")(
 
   const requestedMode = input.dispatchMode ?? "auto";
   if (requestedMode === "start") {
+    yield* prepareSubmission;
+    input.onSubmissionDispatched?.();
     return yield* dispatch({
       type: "message.dispatch",
+      ...(input.jevDecisionId === undefined ? {} : { jevDecisionId: input.jevDecisionId }),
       commandId,
       createdBy: "user",
       creationSource: input.creationSource ?? "web",

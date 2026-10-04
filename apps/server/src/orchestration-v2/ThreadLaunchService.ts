@@ -68,6 +68,7 @@ export interface ThreadLaunchInitialMessage {
 }
 
 export interface ThreadLaunchInput {
+  readonly jevDecisionId?: string;
   readonly commandId: CommandId;
   readonly threadId?: ThreadId;
   readonly reuseExistingThread?: boolean;
@@ -803,6 +804,7 @@ const make = Effect.gen(function* () {
             .dispatch({
               type: "message.dispatch",
               commandId: messageCommandId,
+              ...(input.jevDecisionId === undefined ? {} : { jevDecisionId: input.jevDecisionId }),
               threadId,
               messageId,
               text: input.initialMessage.text,

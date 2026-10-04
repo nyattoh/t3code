@@ -10,6 +10,15 @@ import * as Orchestrator from "./Orchestrator.ts";
 import * as AttachmentClaims from "./AttachmentClaims.ts";
 import * as ThreadLaunch from "./ThreadLaunchService.ts";
 import * as ThreadManagement from "./ThreadManagementService.ts";
+import * as JevRoutingService from "../provider/JevRoutingService.ts";
+import * as JevExecutionReplay from "./JevExecutionReplay.ts";
+
+const validateJevExecution = (input: Parameters<typeof JevRoutingService.validateExecution>[0]) =>
+  JevRoutingService.validateExecution(input).pipe(
+    Effect.mapError(
+      (error) => new AttachmentClaims.AttachmentClaimError({ message: error.detail }),
+    ),
+  );
 
 // These dispatcher failures occur in receipt validation or planning, before
 // commitCommand. Generic dispatch errors can follow a commit and remain uncertain.
@@ -53,6 +62,29 @@ export const dispatchCommand = Effect.fn("ThreadMessageIntake.dispatchCommand")(
   command: OrchestrationV2Command,
 ) {
   const threads = yield* ThreadManagement.ThreadManagementService;
+  const replayThreadId = yield* JevExecutionReplay.prepare({
+    kind: "dispatch",
+    payload: command,
+    commandId: command.commandId,
+    ...(command.type === "message.dispatch"
+      ? {
+          jevDecisionId: command.jevDecisionId,
+          modelSelection: command.modelSelection,
+        }
+      : {}),
+  });
+  // Exact accepted replay: go straight to the existing serialized receipt path,
+  // never claim attachments again or require a new Jev decision.
+  if (replayThreadId !== null) return yield* threads.dispatch(command);
+  if (
+    command.type === "message.dispatch" &&
+    command.jevDecisionId !== undefined &&
+    command.dispatchMode.type !== "start_immediately"
+  ) {
+    return yield* new AttachmentClaims.AttachmentClaimError({
+      message: "Jev decisions require an immediate start.",
+    });
+  }
   if (command.type === "runtime-request.respond" && command.attachmentsByQuestionId) {
     const config = yield* ServerConfig.ServerConfig;
     const incomingByQuestionId = command.attachmentsByQuestionId;
@@ -132,6 +164,11 @@ export const dispatchCommand = Effect.fn("ThreadMessageIntake.dispatchCommand")(
     threadId: command.threadId,
     attachments: command.attachments ?? [],
   });
+  if (command.type === "message.dispatch") {
+    yield* validateJevExecution(command).pipe(
+      Effect.onError(() => AttachmentClaims.releaseClaimedAttachments(claimed.claimedPaths)),
+    );
+  }
   return yield* threads
     .dispatch({
       ...command,
@@ -179,11 +216,24 @@ export const sendToThread = Effect.fn("ThreadMessageIntake.sendToThread")(functi
 });
 
 export const launchThread = Effect.fn("ThreadMessageIntake.launchThread")(function* (
-  input: ThreadLaunch.ThreadLaunchInput,
+  input: ThreadLaunch.ThreadLaunchInput & { readonly jevDecisionId?: string },
 ) {
   const launches = yield* ThreadLaunch.ThreadLaunchService;
+  const replayThreadId = yield* JevExecutionReplay.prepare({
+    kind: "launch",
+    payload: input,
+    commandId: input.commandId,
+    jevDecisionId: input.jevDecisionId,
+    modelSelection: input.modelSelection,
+  });
+  if (replayThreadId !== null) {
+    // Native receipt replay also resumes preparation if acceptance committed
+    // before the background preparation task was scheduled.
+    return yield* launches.launch(input);
+  }
   yield* AttachmentClaims.validateAttachmentLimits(input.initialMessage?.attachments ?? []);
   if (!input.initialMessage?.attachments.some(AttachmentClaims.attachmentIsPendingUpload)) {
+    yield* validateJevExecution(input);
     return yield* launches.launch(input);
   }
   if (input.threadId === undefined) {
@@ -195,6 +245,9 @@ export const launchThread = Effect.fn("ThreadMessageIntake.launchThread")(functi
     threadId: input.threadId,
     attachments: input.initialMessage.attachments,
   });
+  yield* validateJevExecution(input).pipe(
+    Effect.onError(() => AttachmentClaims.releaseClaimedAttachments(claimed.claimedPaths)),
+  );
   return yield* launches
     .launch({
       ...input,

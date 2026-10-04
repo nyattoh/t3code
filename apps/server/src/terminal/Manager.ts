@@ -1332,6 +1332,11 @@ function createTerminalSpawnEnv(
   if (!spawnEnv.COLORTERM && runtimeEnv?.COLORTERM === undefined) {
     spawnEnv.COLORTERM = "truecolor";
   }
+  // Scrub after both merges: provider resolution omits undefined masks, and
+  // terminals without a provider also inherit the server's base environment.
+  for (const key of Object.keys(spawnEnv)) {
+    if (key.toUpperCase() === "TYPESAFE_API_KEY") delete spawnEnv[key];
+  }
   return stripAppImageRuntimeEnv(spawnEnv);
 }
 

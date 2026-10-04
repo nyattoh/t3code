@@ -26,6 +26,9 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as SubscriptionRef from "effect/SubscriptionRef";
+import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
+import { createJevSendGuard, type JevSendState } from "./jevSubmission.ts";
 
 import {
   AVAILABLE_CONNECTION_STATE,
@@ -78,13 +81,22 @@ const makeSupervisor = Effect.fn("TestEnvironmentCommands.makeSupervisor")(funct
   readonly projection?: OrchestrationV2ThreadProjection;
   readonly projectionRequests?: ThreadId[];
   readonly advertiseServerResolvedCommandContext?: boolean;
+  readonly afterAttachmentPersistence?: () => void;
+  readonly executionGate?: Effect.Effect<void>;
+  readonly onExecutionRequest?: () => void;
 }) {
   const client = {
+    [WS_METHODS.assetsPersistChatAttachments]: () =>
+      Effect.sync(() => {
+        input.afterAttachmentPersistence?.();
+        return { attachments: [] };
+      }),
     [ORCHESTRATION_V2_WS_METHODS.dispatchCommand]: (command: OrchestrationV2Command) =>
       Effect.sync(() => {
         input.commands.push(command);
+        input.onExecutionRequest?.();
         return { sequence: input.commands.length };
-      }),
+      }).pipe(Effect.tap(() => input.executionGate ?? Effect.void)),
     [ORCHESTRATION_V2_WS_METHODS.getThreadProjection]: (requestInput: {
       readonly threadId: ThreadId;
     }) =>
@@ -95,12 +107,13 @@ const makeSupervisor = Effect.fn("TestEnvironmentCommands.makeSupervisor")(funct
     [ORCHESTRATION_V2_WS_METHODS.launchThread]: (launchInput: OrchestrationV2ThreadLaunchInput) =>
       Effect.sync(() => {
         input.launches?.push(launchInput);
+        input.onExecutionRequest?.();
         return {
           threadId: launchInput.threadId ?? v2ThreadId,
           projection: input.projection ?? v2Projection,
           resumed: false,
         };
-      }),
+      }).pipe(Effect.tap(() => input.executionGate ?? Effect.void)),
     [WS_METHODS.projectsMutate]: (mutation: ProjectMutation) =>
       Effect.sync(() => {
         input.projects.push(mutation);
@@ -148,6 +161,226 @@ const makeSupervisor = Effect.fn("TestEnvironmentCommands.makeSupervisor")(funct
 });
 
 describe("V2 environment commands", () => {
+  it.effect.each([false, true])(
+    "ends cancellation at the real RPC boundary and navigates only after background acceptance, bootstrap=%s",
+    (bootstrap) =>
+      Effect.gen(function* () {
+        const commands: OrchestrationV2Command[] = [];
+        const launches: OrchestrationV2ThreadLaunchInput[] = [];
+        const entered = yield* Deferred.make<void>();
+        const acknowledge = yield* Deferred.make<void>();
+        let state: JevSendState = {
+          threadKey: "original",
+          generation: 1,
+          fingerprint: "draft/model",
+        };
+        const guard = createJevSendGuard(() => state);
+        const order: string[] = [];
+        const supervisor = yield* makeSupervisor({
+          commands,
+          projects: [],
+          launches,
+          afterAttachmentPersistence: () => {
+            order.push("attachment-persisted");
+            expect(state.threadKey).toBe("original");
+            expect(guard.canCancel()).toBe(true);
+          },
+          onExecutionRequest: () => {
+            order.push("rpc");
+            expect(guard.canCancel()).toBe(false);
+            expect(state.threadKey).toBe("original");
+          },
+          executionGate: Deferred.succeed(entered, undefined).pipe(
+            Effect.andThen(Deferred.await(acknowledge)),
+          ),
+        });
+        const submission = yield* startThreadTurn({
+          commandId: CommandId.make("jev-background"),
+          jevDecisionId: "bound-decision",
+          dispatchMode: "start",
+          isSubmissionCurrent: guard.isCurrent,
+          prepareSubmission: () =>
+            guard.clearDraft(() => {
+              state = { ...state, fingerprint: "cleared" };
+              order.push("clear");
+            }),
+          onSubmissionDispatched: () => {
+            guard.markDispatched();
+            order.push("dispatch-boundary");
+          },
+          threadId: v2ThreadId,
+          message: {
+            messageId: MessageId.make("background"),
+            role: "user",
+            text: "test",
+            attachments: [
+              {
+                type: "image",
+                name: "test.png",
+                mimeType: "image/png",
+                sizeBytes: 1,
+                dataUrl: "data:image/png;base64,AA==",
+              },
+            ],
+          },
+          modelSelection: v2Projection.thread.modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          ...(bootstrap
+            ? {
+                bootstrap: {
+                  createThread: {
+                    projectId: ProjectId.make("project"),
+                    title: "test",
+                    modelSelection: v2Projection.thread.modelSelection,
+                    runtimeMode: "full-access" as const,
+                    interactionMode: "default" as const,
+                    branch: null,
+                    worktreePath: null,
+                    createdAt: v2Now,
+                  },
+                },
+              }
+            : {}),
+        }).pipe(
+          Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+          Effect.forkScoped,
+        );
+        yield* Deferred.await(entered);
+        // The same guard used by the UI refuses a stale Cancel click while the reply is pending.
+        if (guard.canCancel()) state = { ...state, generation: 2 };
+        expect(state.generation).toBe(1);
+        expect(state.threadKey).toBe("original");
+        yield* Deferred.succeed(acknowledge, undefined);
+        yield* Fiber.join(submission);
+        state = { ...state, threadKey: "new background draft" };
+        order.push("navigate");
+        expect(order).toEqual([
+          "attachment-persisted",
+          "clear",
+          "dispatch-boundary",
+          "rpc",
+          "navigate",
+        ]);
+        expect(bootstrap ? launches : commands).toHaveLength(1);
+      }).pipe(Effect.provide(TEST_CRYPTO_LAYER)),
+  );
+  it.effect.each([false, true])(
+    "stops the real startTurn RPC after attachment-await cancellation, bootstrap=%s",
+    (bootstrap) =>
+      Effect.gen(function* () {
+        const commands: OrchestrationV2Command[] = [];
+        const launches: OrchestrationV2ThreadLaunchInput[] = [];
+        let current = true;
+        let draftCleared = false;
+        const supervisor = yield* makeSupervisor({
+          commands,
+          projects: [],
+          launches,
+          afterAttachmentPersistence: () => {
+            current = false;
+          },
+        });
+        const error = yield* startThreadTurn({
+          commandId: CommandId.make("jev-cancelled"),
+          jevDecisionId: "test-decision",
+          isSubmissionCurrent: () => current,
+          prepareSubmission: () => {
+            draftCleared = true;
+            return true;
+          },
+          dispatchMode: "start",
+          threadId: v2ThreadId,
+          message: {
+            messageId: MessageId.make("cancelled-message"),
+            role: "user",
+            text: "test",
+            attachments: [
+              {
+                type: "image",
+                name: "test.png",
+                mimeType: "image/png",
+                sizeBytes: 1,
+                dataUrl: "data:image/png;base64,AA==",
+              },
+            ],
+          },
+          modelSelection: v2Projection.thread.modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          ...(bootstrap
+            ? {
+                bootstrap: {
+                  createThread: {
+                    projectId: ProjectId.make("project"),
+                    title: "test",
+                    modelSelection: v2Projection.thread.modelSelection,
+                    runtimeMode: "full-access" as const,
+                    interactionMode: "default" as const,
+                    branch: null,
+                    worktreePath: null,
+                    createdAt: v2Now,
+                  },
+                },
+              }
+            : {}),
+        }).pipe(
+          Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+          Effect.flip,
+        );
+        expect(error).toMatchObject({ _tag: "JevSelectionError", code: "cancelled" });
+        expect(commands).toEqual([]);
+        expect(launches).toEqual([]);
+        expect(draftCleared).toBe(false);
+      }).pipe(Effect.provide(TEST_CRYPTO_LAYER)),
+  );
+
+  it.effect.each([false, true])(
+    "forwards the decision ID and complete tuple through the real startTurn, bootstrap=%s",
+    (bootstrap) =>
+      Effect.gen(function* () {
+        const commands: OrchestrationV2Command[] = [];
+        const launches: OrchestrationV2ThreadLaunchInput[] = [];
+        const supervisor = yield* makeSupervisor({ commands, projects: [], launches });
+        yield* startThreadTurn({
+          commandId: CommandId.make("jev-start"),
+          jevDecisionId: "bound-decision",
+          isSubmissionCurrent: () => true,
+          dispatchMode: "start",
+          threadId: v2ThreadId,
+          message: {
+            messageId: MessageId.make("jev-message"),
+            role: "user",
+            text: "test",
+            attachments: [],
+          },
+          modelSelection: v2Projection.thread.modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          ...(bootstrap
+            ? {
+                bootstrap: {
+                  createThread: {
+                    projectId: ProjectId.make("project"),
+                    title: "test",
+                    modelSelection: v2Projection.thread.modelSelection,
+                    runtimeMode: "full-access" as const,
+                    interactionMode: "default" as const,
+                    branch: null,
+                    worktreePath: null,
+                    createdAt: v2Now,
+                  },
+                },
+              }
+            : {}),
+        }).pipe(Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor));
+        expect((bootstrap ? launches : commands)[0]).toMatchObject({
+          commandId: "jev-start",
+          jevDecisionId: "bound-decision",
+          modelSelection: v2Projection.thread.modelSelection,
+        });
+      }).pipe(Effect.provide(TEST_CRYPTO_LAYER)),
+  );
   it.effect("routes projects through the event-sourced project transport", () =>
     Effect.gen(function* () {
       const projects: ProjectMutation[] = [];
