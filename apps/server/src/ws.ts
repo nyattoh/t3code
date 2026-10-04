@@ -162,6 +162,7 @@ import {
   observeRpcStreamEffect,
 } from "./observability/RpcInstrumentation.ts";
 import * as ProviderRegistry from "./provider/Services/ProviderRegistry.ts";
+import * as JevRoutingService from "./provider/JevRoutingService.ts";
 import * as ProviderInstanceRegistry from "./provider/Services/ProviderInstanceRegistry.ts";
 import * as AcpRegistrySupport from "./provider/acp/AcpRegistrySupport.ts";
 import * as AcpRegistryRuntimeCoordinator from "./provider/acp/AcpRegistryRuntimeCoordinator.ts";
@@ -1187,6 +1188,8 @@ const makeWsRpcLayer = (
       const sql = yield* SqlClient.SqlClient;
       const threadManagement = yield* ThreadManagementService.ThreadManagementService;
       const intakeContext = yield* Effect.context<
+        | SqlClient.SqlClient
+        | JevRoutingService.JevRoutingService
         | ThreadManagementService.ThreadManagementService
         | ThreadLaunchService.ThreadLaunchService
         | FileSystem.FileSystem
@@ -1258,6 +1261,7 @@ const makeWsRpcLayer = (
       const previewManager = yield* PreviewManager.PreviewManager;
       const portDiscovery = yield* PortScanner.PortDiscovery;
       const providerRegistry = yield* ProviderRegistry.ProviderRegistry;
+      const jevRouting = yield* JevRoutingService.JevRoutingService;
       const modelManifest = yield* ModelManifest.ModelManifest;
       const providerVersionCache = yield* ProviderMaintenance.ProviderVersionCache;
       const providerInstances = yield* ProviderInstanceRegistry.ProviderInstanceRegistry;
@@ -1949,6 +1953,9 @@ const makeWsRpcLayer = (
               .enqueueCommand(
                 ThreadMessageIntake.launchThread({
                   commandId: input.commandId,
+                  ...(input.jevDecisionId === undefined
+                    ? {}
+                    : { jevDecisionId: input.jevDecisionId }),
                   ...(input.threadId === undefined ? {} : { threadId: input.threadId }),
                   ...(input.reuseExistingThread === undefined
                     ? {}
@@ -2257,6 +2264,10 @@ const makeWsRpcLayer = (
               "provider.instance_id": input.instanceId,
             },
           ),
+        [WS_METHODS.serverSelectModelRoute]: (input) =>
+          observeRpcEffect(WS_METHODS.serverSelectModelRoute, jevRouting.select(input), {
+            "rpc.aggregate": "server",
+          }),
         [WS_METHODS.serverRefreshProviders]: (input) =>
           observeRpcEffect(
             WS_METHODS.serverRefreshProviders,

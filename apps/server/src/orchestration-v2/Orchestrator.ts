@@ -4691,6 +4691,16 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         (candidate) => candidate.id === projection.thread.activeProviderThreadId,
       );
       const activeRun = projection.runs.find(isBlockingRun);
+      // This projection is read under the serialized thread dispatch lock.
+      // An idle-only Jev choice must never turn into a queued run when another
+      // client won the race while the decision or uploads were in flight.
+      if (command.jevDecisionId !== undefined && activeRun !== undefined) {
+        return yield* new OrchestratorCommandRejectedError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: "Jev selection requires an idle thread. Another run started before dispatch.",
+        });
+      }
       const pendingMergeBackTransfers = pendingMergeBackTransfersForThread(projection);
       const shouldQueue =
         activeRun !== undefined &&

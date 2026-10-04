@@ -6,6 +6,7 @@ import { Atom } from "effect/unstable/reactivity";
 import {
   WS_METHODS,
   type EnvironmentId,
+  type JevRouteInput,
   type OrchestrationV2ShellSnapshot,
 } from "@t3tools/contracts";
 
@@ -57,6 +58,7 @@ import {
   archiveThread,
   cancelQueuedRun,
   createThread,
+  selectModelRoute,
   deleteThread,
   editQueuedRun,
   interruptThreadTurn,
@@ -273,6 +275,15 @@ export function createThreadEnvironmentAtoms<R, E>(
       execute: (input: SetThreadInteractionModeInput) => setThreadInteractionMode(input),
       scheduler,
       concurrency,
+    }),
+    selectModelRoute: createEnvironmentCommand(runtime, {
+      label: "environment-data:commands:thread:select-model-route",
+      execute: (input: JevRouteInput) => selectModelRoute(input),
+      scheduler,
+      concurrency: {
+        mode: "singleFlight",
+        key: ({ environmentId, input }) => `${environmentId}:${input.requestId}`,
+      },
     }),
     startTurn: createEnvironmentCommand(runtime, {
       label: "environment-data:commands:thread:start-turn",

@@ -3,6 +3,7 @@ import {
   AuthOrchestrationReadScope,
   AuthRelayReadScope,
   AuthRelayWriteScope,
+  ORCHESTRATION_V2_WS_METHODS,
   WS_METHODS,
   WsRpcGroup,
 } from "@t3tools/contracts";
@@ -19,6 +20,15 @@ import {
 } from "./RpcAuthorization.ts";
 
 describe("RPC authorization scopes", () => {
+  it("requires operate permission for paid selection and both execution transports", () => {
+    for (const method of [
+      WS_METHODS.serverSelectModelRoute,
+      ORCHESTRATION_V2_WS_METHODS.dispatchCommand,
+      ORCHESTRATION_V2_WS_METHODS.launchThread,
+    ]) {
+      expect(requiredScopeForRpcMethod(method)).toBe(AuthOrchestrationOperateScope);
+    }
+  });
   it("declares exactly one scope for every RPC in the server group", () => {
     expect(new Set(Object.keys(RPC_REQUIRED_SCOPES))).toEqual(new Set(WsRpcGroup.requests.keys()));
   });
@@ -122,7 +132,11 @@ it("requires operate permission for tool updates even alongside a read-only chec
 });
 
 describe("RPC scope middleware", () => {
-  const tested = [WS_METHODS.serverProbe, WS_METHODS.serverRetryResourceTelemetry] as const;
+  const tested = [
+    WS_METHODS.serverProbe,
+    WS_METHODS.serverRetryResourceTelemetry,
+    WS_METHODS.serverSelectModelRoute,
+  ] as const;
   const group = WsRpcGroup.omit(
     ...[...WsRpcGroup.requests.keys()].filter(
       (tag): tag is Exclude<keyof typeof RPC_REQUIRED_SCOPES, (typeof tested)[number]> =>
@@ -140,6 +154,9 @@ describe("RPC scope middleware", () => {
             group.toLayerHandler(WS_METHODS.serverRetryResourceTelemetry, () =>
               Effect.sync(() => handled.push("retry")).pipe(Effect.andThen(Effect.never)),
             ),
+            group.toLayerHandler(WS_METHODS.serverSelectModelRoute, () =>
+              Effect.sync(() => handled.push("paid-selection")).pipe(Effect.andThen(Effect.never)),
+            ),
             rpcScopeAuthorizationLayer([AuthOrchestrationReadScope]),
           ),
         ),
@@ -148,6 +165,22 @@ describe("RPC scope middleware", () => {
       expect(yield* client[WS_METHODS.serverProbe]({})).toEqual({});
       expect(
         yield* client[WS_METHODS.serverRetryResourceTelemetry]({}).pipe(Effect.flip),
+      ).toMatchObject({
+        _tag: "EnvironmentAuthorizationError",
+        requiredScope: AuthOrchestrationOperateScope,
+      });
+      expect(handled).toEqual([]);
+      expect(
+        yield* client[WS_METHODS.serverSelectModelRoute]({
+          requestId: "auth-test" as import("@t3tools/contracts").CommandId,
+          mode: "jev",
+          baseline: {
+            instanceId: "codex" as import("@t3tools/contracts").ProviderInstanceId,
+            model: "test",
+          },
+          taskSummary: "test",
+          policy: "test",
+        }).pipe(Effect.flip),
       ).toMatchObject({
         _tag: "EnvironmentAuthorizationError",
         requiredScope: AuthOrchestrationOperateScope,

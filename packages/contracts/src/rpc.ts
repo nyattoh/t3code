@@ -1,4 +1,5 @@
 import { OrchestrationDispatchCommandError } from "./orchestrationDispatch.ts";
+import { JevRouteInput, JevRouteDecision, JevSelectionError } from "./jevRouting.ts";
 import {
   ChatGptReconnectProfileInput,
   ChatGptReconnectProfile,
@@ -434,6 +435,7 @@ export const WS_METHODS = {
   serverProbe: "server.probe",
   serverGetConfig: "server.getConfig",
   serverRefreshProviders: "server.refreshProviders",
+  serverSelectModelRoute: "server.selectModelRoute",
   serverUpdateProvider: "server.updateProvider",
   serverUpdateServer: "server.updateServer",
   serverUpdateServerWithProgress: "server.updateServerWithProgress",
@@ -578,6 +580,12 @@ const WsServerRefreshProvidersRpc = Rpc.make(WS_METHODS.serverRefreshProviders, 
   }),
   success: ServerProviderUpdatedPayload,
   error: Schema.Union([EnvironmentAuthorizationError, ProviderSetupError]),
+});
+
+const WsServerSelectModelRouteRpc = Rpc.make(WS_METHODS.serverSelectModelRoute, {
+  payload: JevRouteInput,
+  success: JevRouteDecision,
+  error: Schema.Union([JevSelectionError, EnvironmentAuthorizationError]),
 });
 
 const WsServerUpdateProviderRpc = Rpc.make(WS_METHODS.serverUpdateProvider, {
@@ -1703,6 +1711,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsServerProbeRpc,
   WsServerGetConfigRpc,
   WsServerRefreshProvidersRpc,
+  WsServerSelectModelRouteRpc,
   WsServerUpdateProviderRpc,
   WsProviderConsumeResetCreditRpc,
   WsProviderAuthStartRpc,

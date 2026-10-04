@@ -4,10 +4,34 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Path from "effect/Path";
+import * as Stream from "effect/Stream";
+import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 
 import { mergeProviderInstanceEnvironment } from "./ProviderInstanceEnvironment.ts";
 
 describe("mergeProviderInstanceEnvironment", () => {
+  it.effect("masks the Jev key when the real spawner extends the host environment", () =>
+    Effect.gen(function* () {
+      const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+      const childEnvironment = mergeProviderInstanceEnvironment(undefined, {
+        PATH: process.env.PATH,
+        TYPESAFE_API_KEY: "mock-key-not-a-credential",
+      });
+      const child = yield* spawner.spawn(
+        ChildProcess.make(
+          process.execPath,
+          [
+            "-e",
+            "process.stdout.write(String(Object.keys(process.env).some(k => k.toUpperCase() === 'TYPESAFE_API_KEY')))",
+          ],
+          { env: childEnvironment, extendEnv: true },
+        ),
+      );
+      const chunks = yield* Stream.runCollect(child.stdout);
+      expect(Buffer.concat(chunks).toString()).toBe("false");
+      expect(yield* child.exitCode).toBe(0);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
   it.effect.each([
     { value: "~/.account", tail: ".account" },
     { value: "~\\.account\\work", tail: ".account\\work" },
@@ -28,6 +52,7 @@ describe("mergeProviderInstanceEnvironment", () => {
       );
 
       expect(environment).toEqual({
+        TYPESAFE_API_KEY: undefined,
         CODEX_HOME: path.join(NodeOS.homedir(), tail),
         CLAUDE_CONFIG_DIR: path.join(NodeOS.homedir(), tail),
         CUSTOM_VALUE: value,
@@ -47,7 +72,7 @@ describe("mergeProviderInstanceEnvironment", () => {
         [{ name: "CUSTOM_VALUE", value: "~/.custom", sensitive: false }],
         baseEnv,
       ),
-    ).toEqual({ ...baseEnv, CUSTOM_VALUE: "~/.custom" });
+    ).toEqual({ ...baseEnv, CUSTOM_VALUE: "~/.custom", TYPESAFE_API_KEY: undefined });
   });
 
   it("overrides inherited environment values and preserves empty strings", () => {

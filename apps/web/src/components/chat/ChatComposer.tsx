@@ -1531,6 +1531,7 @@ export interface ChatComposerProps {
   canInterrupt: boolean;
   isConnecting: boolean;
   isSendBusy: boolean;
+  submissionLocked?: boolean;
   canResume: boolean;
   isRevertingCheckpoint?: boolean;
   sendDisabledReason: string | null;
@@ -1707,6 +1708,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     canInterrupt,
     isConnecting,
     isSendBusy,
+    submissionLocked = false,
     canResume,
     isRevertingCheckpoint = false,
     sendDisabledReason: externalSendDisabledReason,
@@ -7384,6 +7386,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                                   : "Ask anything, @tag files/folders, $use skills, or / for commands"
                     }
                     disabled={
+                      submissionLocked ||
                       isConnecting ||
                       isComposerApprovalState ||
                       projectSelectionRequired ||

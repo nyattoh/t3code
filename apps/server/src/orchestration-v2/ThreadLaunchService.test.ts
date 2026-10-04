@@ -7,6 +7,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as ServerConfig from "../config.ts";
 import { createPendingAttachmentId, resolveAttachmentPath } from "../attachmentStore.ts";
 import * as ThreadMessageIntake from "./ThreadMessageIntake.ts";
+import * as JevExecutionReplay from "./JevExecutionReplay.ts";
 import { assert, it, vi } from "@effect/vitest";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import {
@@ -59,6 +60,117 @@ import * as ThreadLaunch from "./ThreadLaunchService.ts";
 import * as ThreadManagement from "./ThreadManagementService.ts";
 import * as ThreadTitleRegeneration from "./ThreadTitleRegenerationService.ts";
 import { makeOrchestratorV2ReplayLayerWithRegistry } from "./testkit/ProviderReplayHarness.ts";
+import * as JevRouting from "../provider/JevRoutingService.ts";
+import * as ProviderRegistry from "../provider/Services/ProviderRegistry.ts";
+
+const makeJevRoutingTestLayer = (
+  choose = vi.fn(async () => ({
+    model: "jev-mock",
+    answers: {
+      route: {
+        type: "choice",
+        choice: "candidate_0",
+        confidence: 1,
+        probabilities: { candidate_0: 1, insufficient_evidence: 0 },
+      },
+    },
+  })),
+) =>
+  JevRouting.layer.pipe(
+    Layer.provide(
+      Layer.mergeAll(
+        Layer.succeed(ProviderRegistry.ProviderRegistry, {
+          getProviders: Effect.succeed([
+            {
+              instanceId: modelSelection.instanceId,
+              driver: ProviderDriverKind.make("codex"),
+              version: null,
+              checkedAt: "2026-10-04T00:00:00.000Z" as ServerProvider["checkedAt"],
+              slashCommands: [],
+              skills: [],
+              enabled: true,
+              installed: true,
+              status: "ready",
+              auth: { status: "authenticated" },
+              models: [
+                {
+                  slug: modelSelection.model,
+                  name: "Verified",
+                  isCustom: false,
+                  capabilities: {
+                    optionDescriptors: [
+                      {
+                        id: "reasoningEffort",
+                        label: "Reasoning",
+                        type: "select",
+                        options: [{ id: "low", label: "Low" }],
+                      },
+                    ],
+                  },
+                },
+              ],
+            },
+          ] as ReadonlyArray<ServerProvider>),
+        } as ProviderRegistry.ProviderRegistry["Service"]),
+        Layer.succeed(
+          JevRouting.JevClient,
+          JevRouting.JevClient.of({
+            choose,
+          }),
+        ),
+      ),
+    ),
+  );
+
+it.effect(
+  "replays a real accepted Jev launch after restart and rejects changed launch input",
+  () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const original = launchInput({
+        command: "jev-launch",
+        thread: "jev-launched-thread",
+        message: "test",
+      });
+      const service = yield* JevRouting.JevRoutingService;
+      const decision = yield* service.select({
+        requestId: original.commandId,
+        mode: "jev",
+        baseline: modelSelection,
+        taskSummary: "test",
+        policy: "test",
+      });
+      const input = {
+        ...original,
+        modelSelection: decision.selection,
+        jevDecisionId: decision.decisionId!,
+      };
+      const first = yield* ThreadMessageIntake.launchThread(input);
+      const replay = yield* ThreadMessageIntake.launchThread(input).pipe(
+        Effect.provide(makeJevRoutingTestLayer()),
+      );
+      assert.equal(replay.threadId, first.threadId);
+      assert.isTrue(replay.resumed);
+      assert.equal(replay.projection.runs.length, 1);
+      assert.equal(replay.projection.runs[0]!.id, first.projection.runs[0]!.id);
+      const changed = yield* ThreadMessageIntake.launchThread({ ...input, title: "tampered" }).pipe(
+        Effect.provide(makeJevRoutingTestLayer()),
+        Effect.flip,
+      );
+      assert.equal(changed._tag, "AttachmentClaimError");
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          harness.layer,
+          makeJevRoutingTestLayer(),
+          ServerConfig.layerTest(process.cwd(), { prefix: "jev-launch-test-" }).pipe(
+            Layer.provideMerge(NodeServices.layer),
+          ),
+        ),
+      ),
+    );
+  },
+);
 
 const projectId = ProjectId.make("project:launch-test");
 const otherProjectId = ProjectId.make("project:launch-other");
@@ -1863,6 +1975,150 @@ it.effect("schedules an accepted preparing message exactly once across concurren
       yield* Deferred.succeed(allowSetup, undefined);
     }).pipe(Effect.provide(harness.layer));
   }),
+);
+
+it.effect(
+  "Jev intake recovers acceptance before scheduling without another choice or upload claim",
+  () =>
+    Effect.gen(function* () {
+      const setupEntered = yield* Deferred.make<void>();
+      const allowSetup = yield* Deferred.make<void>();
+      const choose = vi.fn(async () => ({
+        model: "jev-mock",
+        answers: {
+          route: {
+            type: "choice",
+            choice: "candidate_0",
+            confidence: 1,
+            probabilities: { candidate_0: 1, insufficient_evidence: 0 },
+          },
+        },
+      }));
+      const harness = makeHarness({
+        runSetup: () =>
+          Deferred.succeed(setupEntered, undefined).pipe(
+            Effect.andThen(Deferred.await(allowSetup)),
+            Effect.as({ status: "no-script" as const }),
+          ),
+      });
+      yield* Effect.gen(function* () {
+        const threads = yield* ThreadManagement.ThreadManagementService;
+        const routing = yield* JevRouting.JevRoutingService;
+        const original = launchInput({
+          command: "jev-accepted-before-schedule",
+          thread: "jev-recovery-thread",
+          message: "Resume committed launch",
+        });
+        const decision = yield* routing.select({
+          requestId: original.commandId,
+          mode: "jev",
+          baseline: modelSelection,
+          taskSummary: "test",
+          policy: "test",
+        });
+        const attachment: ChatAttachment = {
+          type: "image",
+          id: ChatAttachmentId.make(createPendingAttachmentId()),
+          name: "already-uploaded.png",
+          mimeType: "image/png",
+          sizeBytes: 4,
+        };
+        const input = {
+          ...original,
+          modelSelection: decision.selection,
+          jevDecisionId: decision.decisionId!,
+          initialMessage: { ...original.initialMessage!, attachments: [attachment] },
+        };
+        const durableAttachment = {
+          ...attachment,
+          id: ChatAttachmentId.make("jev-recovery-thread-00000000-0000-4000-8000-000000000001"),
+        };
+        // Commit the same durable digest/receipts as intake, but simulate process
+        // interruption before ThreadLaunchService schedules any preparation.
+        assert.isNull(
+          yield* JevExecutionReplay.prepare({
+            kind: "launch",
+            payload: input,
+            commandId: input.commandId,
+            jevDecisionId: input.jevDecisionId,
+            modelSelection: input.modelSelection,
+          }),
+        );
+        yield* threads.dispatch({
+          type: "thread.create",
+          commandId: input.commandId,
+          threadId: input.threadId,
+          projectId: input.projectId,
+          title: input.title,
+          modelSelection: input.modelSelection,
+          runtimeMode: input.runtimeMode,
+          interactionMode: input.interactionMode,
+          branch: null,
+          worktreePath: null,
+          createdBy: input.createdBy,
+          creationSource: input.creationSource,
+        });
+        yield* threads.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make(`${input.commandId}:initial-message`),
+          jevDecisionId: input.jevDecisionId,
+          threadId: input.threadId,
+          messageId: input.initialMessage.messageId!,
+          text: input.initialMessage.text,
+          attachments: [durableAttachment],
+          modelSelection: input.modelSelection,
+          dispatchMode: { type: "defer_start", workspaceStrategy: input.workspaceStrategy },
+          createdBy: input.createdBy,
+          creationSource: input.creationSource,
+        });
+        const before = yield* threads.getThreadProjection(input.threadId);
+        assert.equal(before.runs[0]?.status, "preparing");
+        assert.equal(harness.runSetup.mock.calls.length, 0);
+
+        // Both retries have a fresh decision cache. The pending upload is absent:
+        // any accidental reclaim or live-decision lookup would reject the replay.
+        const [first, second] = yield* Effect.all(
+          [ThreadMessageIntake.launchThread(input), ThreadMessageIntake.launchThread(input)],
+          { concurrency: "unbounded" },
+        ).pipe(Effect.provide(makeJevRoutingTestLayer(choose)));
+        yield* Deferred.await(setupEntered);
+        assert.isTrue(first.resumed);
+        assert.isTrue(second.resumed);
+        assert.equal(harness.runSetup.mock.calls.length, 1);
+        assert.equal(choose.mock.calls.length, 1);
+        yield* Deferred.succeed(allowSetup, undefined);
+        yield* threads.streamStoredEventsFrom({ threadId: input.threadId }).pipe(
+          Stream.filter(
+            (stored) =>
+              stored.event.type === "run.updated" &&
+              stored.event.payload.id === before.runs[0]?.id &&
+              stored.event.payload.status === "starting",
+          ),
+          Stream.runHead,
+        );
+        const recovered = yield* threads.getThreadProjection(input.threadId);
+        assert.equal(recovered.runs.length, 1);
+        assert.equal(recovered.runs[0]?.id, before.runs[0]?.id);
+        assert.equal(recovered.runs[0]?.status, "starting");
+        assert.equal(recovered.messages.length, 1);
+        assert.deepEqual(recovered.messages[0]?.attachments, [durableAttachment]);
+        yield* ThreadMessageIntake.launchThread(input).pipe(
+          Effect.provide(makeJevRoutingTestLayer(choose)),
+        );
+        assert.equal(harness.runSetup.mock.calls.length, 1);
+        assert.equal(choose.mock.calls.length, 1);
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            harness.layer,
+            makeJevRoutingTestLayer(choose),
+            ServerConfig.layerTest(process.cwd(), { prefix: "jev-launch-recovery-" }).pipe(
+              Layer.provideMerge(NodeServices.layer),
+            ),
+          ),
+        ),
+      );
+    }),
 );
 
 it.effect("creates a strong provider-thread mapping for an imported native session", () => {
