@@ -48,3 +48,7 @@ The Jev fork recorded its own migration as `57 JevExecutionRequests`. Official T
 4. Import the exported rows into the Jev store with `--import-legacy` (see Storage).
 
 It refuses a history it does not recognize, a non-empty WAL, and a database another process holds the write lock on. Running it again on a converted database does nothing.
+
+## Configuration
+
+See [docs/configure.md](docs/configure.md) for Codex and Claude setup.
