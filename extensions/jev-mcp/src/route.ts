@@ -194,11 +194,19 @@ export async function route(
   const digest = requestDigest(input);
   const timeoutMs = deps.timeoutMs ?? 10_000;
   const deadline = Date.now() + 2 * timeoutMs + 1_000;
+  let token: string;
   for (;;) {
-    const { state, row } = deps.store.claim(input.requestId, digest, Date.now(), timeoutMs + 1_000);
+    const {
+      state,
+      row,
+      token: claimed,
+    } = deps.store.claim(input.requestId, digest, Date.now(), timeoutMs + 1_000);
     if (row.requestDigest !== digest) throw new JevError("duplicate-request");
     if (row.decision !== null) return { ...row.decision, replayed: true };
-    if (state === "claimed") break;
+    if (state === "claimed") {
+      token = claimed!;
+      break;
+    }
     if (Date.now() > deadline) throw new JevError("timeout");
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
@@ -210,7 +218,7 @@ export async function route(
     };
     deps.store.complete(input.requestId, decision);
   } catch (error) {
-    deps.store.release(input.requestId);
+    deps.store.release(input.requestId, token);
     throw error;
   }
   return { ...deps.store.get(input.requestId)!.decision!, replayed: false };
