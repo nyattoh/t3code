@@ -50,7 +50,8 @@ export type DbState = {
 export type Report = {
   readonly apply: boolean;
   readonly before: Omit<DbState, "jevRows"> & { readonly jevRows: number | null };
-  readonly exportPath: string;
+  /** Null when there is no Jev table, so a rerun never overwrites an earlier export. */
+  readonly exportPath: string | null;
   readonly statements: ReadonlyArray<string>;
   readonly after?: Omit<DbState, "jevRows"> & { readonly quickCheck: string };
 };
@@ -164,9 +165,12 @@ export function cutover(options: {
     db.exec("BEGIN IMMEDIATE");
     const before = inspect(db);
     const statements = plan(before);
-    NodeFS.mkdirSync(options.exportDir, { recursive: true });
-    const exportPath = NodePath.join(options.exportDir, "jev_execution_requests.json");
-    NodeFS.writeFileSync(exportPath, JSON.stringify(before.jevRows ?? [], null, 2));
+    let exportPath: string | null = null;
+    if (before.jevRows !== null) {
+      NodeFS.mkdirSync(options.exportDir, { recursive: true });
+      exportPath = NodePath.join(options.exportDir, "jev_execution_requests.json");
+      NodeFS.writeFileSync(exportPath, JSON.stringify(before.jevRows, null, 2));
+    }
     const report: Report = {
       apply: options.apply,
       before: withoutRows(before),
