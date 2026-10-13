@@ -39,23 +39,69 @@ export class JevStore {
         request_id TEXT PRIMARY KEY NOT NULL,
         request_digest TEXT NOT NULL,
         decision_json TEXT,
+        claim_expires_at INTEGER,
         created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
       )
     `);
+    const columns = this.#db
+      .prepare("PRAGMA table_info(jev_requests)")
+      .all()
+      .map((c) => String(c.name));
+    if (!columns.includes("claim_expires_at"))
+      this.#db.exec("ALTER TABLE jev_requests ADD COLUMN claim_expires_at INTEGER");
   }
 
-  /** Records the request before Jev is called and returns whatever row now owns the id. */
-  reserve(requestId: string, requestDigest: string): StoredRequest {
+  /**
+   * Records the request and, in the same transaction, claims the right to call Jev for it.
+   * Every MCP session runs its own process, so the claim lives in the shared file:
+   * "claimed" means this caller must call Jev and then complete or release, "pending"
+   * means another caller holds an unexpired claim, "settled" means the row already
+   * has a decision or belongs to different input.
+   */
+  claim(
+    requestId: string,
+    requestDigest: string,
+    now: number,
+    ttlMs: number,
+  ): { readonly state: "claimed" | "pending" | "settled"; readonly row: StoredRequest } {
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      this.#db
+        .prepare("INSERT OR IGNORE INTO jev_requests (request_id, request_digest) VALUES (?, ?)")
+        .run(requestId, requestDigest);
+      const row = this.get(requestId)!;
+      const { expires } = this.#db
+        .prepare("SELECT claim_expires_at AS expires FROM jev_requests WHERE request_id = ?")
+        .get(requestId) as { expires: number | null };
+      let state: "claimed" | "pending" | "settled";
+      if (row.decision !== null || row.requestDigest !== requestDigest) state = "settled";
+      else if (expires !== null && expires > now) state = "pending";
+      else {
+        this.#db
+          .prepare("UPDATE jev_requests SET claim_expires_at = ? WHERE request_id = ?")
+          .run(now + ttlMs, requestId);
+        state = "claimed";
+      }
+      this.#db.exec("COMMIT");
+      return { state, row };
+    } catch (error) {
+      this.#db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  release(requestId: string): void {
     this.#db
-      .prepare("INSERT OR IGNORE INTO jev_requests (request_id, request_digest) VALUES (?, ?)")
-      .run(requestId, requestDigest);
-    return this.get(requestId)!;
+      .prepare(
+        "UPDATE jev_requests SET claim_expires_at = NULL WHERE request_id = ? AND decision_json IS NULL",
+      )
+      .run(requestId);
   }
 
   complete(requestId: string, decision: Decision): void {
     this.#db
       .prepare(
-        "UPDATE jev_requests SET decision_json = ? WHERE request_id = ? AND decision_json IS NULL",
+        "UPDATE jev_requests SET decision_json = ?, claim_expires_at = NULL WHERE request_id = ? AND decision_json IS NULL",
       )
       .run(JSON.stringify(decision), requestId);
   }
