@@ -230,7 +230,7 @@ NodeTest.test("waits for another process's write instead of failing busy", async
     NodePath.resolve(import.meta.dirname, "../src/store.ts"),
   ).href;
   const script = `import { JevStore } from ${JSON.stringify(storeUrl)};
-new JevStore(${JSON.stringify(path)}).reserve("req-busy", "d");`;
+new JevStore(${JSON.stringify(path)}).claim("req-busy", "d", Date.now(), 1000);`;
   const worker = NodeChildProcess.spawn(process.execPath, ["--input-type=module", "-e", script], {
     stdio: ["ignore", "ignore", "pipe"],
   });
@@ -243,4 +243,69 @@ new JevStore(${JSON.stringify(path)}).reserve("req-busy", "d");`;
   NodeAssert.equal(await exited, 0, stderr);
   NodeAssert.equal(store.get("req-busy")?.requestDigest, "d");
   holder.close();
+});
+
+const slowCall = (response: unknown, ms = 200) => {
+  const calls: unknown[] = [];
+  const call: JevCall = async (body) => {
+    calls.push(body);
+    await new Promise((resolve) => setTimeout(resolve, ms));
+    return response;
+  };
+  return { call, calls };
+};
+
+NodeTest.test(
+  "coalesces concurrent calls for one requestId across stores on the same file",
+  async () => {
+    const path = tempDb();
+    const { call, calls } = slowCall(
+      answer("c0", { c0: 0.7, c1: 0.2, insufficient_evidence: 0.1 }),
+    );
+    const [a, b] = await Promise.all([
+      route(input, { store: new JevStore(path), call }),
+      route(input, { store: new JevStore(path), call }),
+    ]);
+    NodeAssert.equal(calls.length, 1);
+    NodeAssert.equal(a.decisionId, b.decisionId);
+    NodeAssert.deepEqual([a.replayed, b.replayed].sort(), [false, true]);
+  },
+);
+
+NodeTest.test("a failed call releases the claim so the next caller asks again", async () => {
+  const store = new JevStore(":memory:");
+  const failing: JevCall = async () => {
+    throw new JevError("transport");
+  };
+  await NodeAssert.rejects(
+    route(input, { store, call: failing }),
+    (e: unknown) => e instanceof JevError && e.code === "transport",
+  );
+  const { call, calls } = countingCall(
+    answer("c1", { c0: 0.1, c1: 0.8, insufficient_evidence: 0.1 }),
+  );
+  const started = Date.now();
+  const result = await route(input, { store, call });
+  NodeAssert.equal(calls.length, 1);
+  NodeAssert.equal(result.reasoningEffort, "high");
+  NodeAssert.ok(Date.now() - started < 1_000);
+});
+
+NodeTest.test("answers non-object JSON with Invalid Request and keeps serving", () => {
+  const main = NodeURL.fileURLToPath(new URL("../src/main.ts", import.meta.url));
+  const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "jev-mcp-bad-"));
+  const run = NodeChildProcess.spawnSync(process.execPath, [main], {
+    input: ["null", "[1]", '"x"', '{"jsonrpc":"2.0","id":7,"method":"ping"}'].join("\n") + "\n",
+    env: { ...process.env, T3CODE_HOME: dir },
+    encoding: "utf8",
+  });
+  NodeAssert.equal(run.status, 0, run.stderr);
+  const responses = run.stdout
+    .trim()
+    .split("\n")
+    .map((l) => JSON.parse(l));
+  NodeAssert.deepEqual(
+    responses.map((r) => r.error?.code ?? r.id),
+    [-32600, -32600, -32600, 7],
+  );
 });

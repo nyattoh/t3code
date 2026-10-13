@@ -181,23 +181,37 @@ export function httpJevCall(
 
 /**
  * Same requestId and input returns the stored decision without calling Jev again.
- * A request recorded without a decision (crash, lost reply, legacy import) is re-asked:
- * selection has no side effects, so asking twice is safe.
+ * Concurrent callers with one requestId, in this process or another, coalesce on the
+ * store's claim, so Jev is called once. A request recorded without a decision (crash,
+ * lost reply, legacy import) is asked again once its claim expires: selection has no
+ * side effects.
  */
 export async function route(
   raw: unknown,
   deps: { readonly store: JevStore; readonly call: JevCall; readonly timeoutMs?: number },
 ): Promise<RouteResult> {
   const input = parseRouteInput(raw);
-  const stored = deps.store.reserve(input.requestId, requestDigest(input));
-  if (stored.requestDigest !== requestDigest(input)) throw new JevError("duplicate-request");
-  if (stored.decision !== null) return { ...stored.decision, replayed: true };
-  const signal = AbortSignal.timeout(deps.timeoutMs ?? 10_000);
-  const response = await deps.call(jevRequestBody(input), signal);
-  const decision: Decision = {
-    decisionId: NodeCrypto.randomUUID(),
-    ...parseJevResponse(response, input),
-  };
-  deps.store.complete(input.requestId, decision);
+  const digest = requestDigest(input);
+  const timeoutMs = deps.timeoutMs ?? 10_000;
+  const deadline = Date.now() + 2 * timeoutMs + 1_000;
+  for (;;) {
+    const { state, row } = deps.store.claim(input.requestId, digest, Date.now(), timeoutMs + 1_000);
+    if (row.requestDigest !== digest) throw new JevError("duplicate-request");
+    if (row.decision !== null) return { ...row.decision, replayed: true };
+    if (state === "claimed") break;
+    if (Date.now() > deadline) throw new JevError("timeout");
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  try {
+    const response = await deps.call(jevRequestBody(input), AbortSignal.timeout(timeoutMs));
+    const decision: Decision = {
+      decisionId: NodeCrypto.randomUUID(),
+      ...parseJevResponse(response, input),
+    };
+    deps.store.complete(input.requestId, decision);
+  } catch (error) {
+    deps.store.release(input.requestId);
+    throw error;
+  }
   return { ...deps.store.get(input.requestId)!.decision!, replayed: false };
 }
