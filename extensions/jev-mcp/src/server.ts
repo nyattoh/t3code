@@ -45,6 +45,18 @@ type Message = {
   params?: Record<string, unknown>;
 };
 
+const isMessage = (value: unknown): value is Message => {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const { jsonrpc, id, method, params } = value as Record<string, unknown>;
+  return (
+    jsonrpc === "2.0" &&
+    (id === undefined || id === null || typeof id === "string" || typeof id === "number") &&
+    (method === undefined || typeof method === "string") &&
+    (params === undefined ||
+      (typeof params === "object" && params !== null && !Array.isArray(params)))
+  );
+};
+
 export type ServerDeps = {
   readonly store: JevStore;
   readonly call: JevCall;
@@ -114,14 +126,20 @@ export function serve(
   lines.on("line", (line) => {
     if (line.trim().length === 0) return;
     const task = (async () => {
-      let message: Message;
+      let parsed: unknown;
       try {
-        message = JSON.parse(line) as Message;
+        parsed = JSON.parse(line);
       } catch {
         output.write(`${JSON.stringify(failure(null, -32700, "Parse error"))}\n`);
         return;
       }
-      const response = await handle(message, deps);
+      if (!isMessage(parsed)) {
+        output.write(`${JSON.stringify(failure(null, -32600, "Invalid Request"))}\n`);
+        return;
+      }
+      const response = await handle(parsed, deps).catch((error: unknown) =>
+        parsed.id === undefined ? undefined : failure(parsed.id, -32603, String(error)),
+      );
       if (response !== undefined) output.write(`${JSON.stringify(response)}\n`);
     })();
     pending.add(task);

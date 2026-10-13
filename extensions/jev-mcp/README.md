@@ -15,7 +15,7 @@ Each `requestId` is recorded before Jev is called. Repeating a request with the 
 Rows exported from T3's former `jev_execution_requests` table import with:
 
 ```sh
-node extensions/jev-mcp/src/main.ts --import-legacy jev_execution_requests.json
+node extensions/jev-mcp/src/main.ts --import-legacy jev_execution_requests-<timestamp>.json
 ```
 
 ## Requirements
@@ -33,7 +33,7 @@ cd extensions/jev-mcp && node --test test/*.test.ts
 The Jev fork recorded its own migration as `57 JevExecutionRequests`. Official T3 Code uses 57 for `ScheduledTaskWebhooks` and refuses to start on that history. `cutover/cutover.ts` rewrites such a database so official builds open it.
 
 1. Quit T3 Code.
-2. Dry run. It prints the plan and writes `jev_execution_requests.json` without changing the database:
+2. Dry run. It prints the plan and writes a new `jev_execution_requests-<timestamp>.json` without changing the database. Exports are never overwritten:
 
    ```sh
    node extensions/jev-mcp/cutover/cutover.ts --db "$T3CODE_HOME/userdata/statev2.sqlite" --export-dir ./jev-export

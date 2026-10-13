@@ -50,7 +50,7 @@ export type DbState = {
 export type Report = {
   readonly apply: boolean;
   readonly before: Omit<DbState, "jevRows"> & { readonly jevRows: number | null };
-  /** Null when there is no Jev table, so a rerun never overwrites an earlier export. */
+  /** A new timestamped file per run; null when there is no Jev table. Exports are never overwritten. */
   readonly exportPath: string | null;
   readonly statements: ReadonlyArray<string>;
   readonly after?: Omit<DbState, "jevRows"> & { readonly quickCheck: string };
@@ -168,8 +168,10 @@ export function cutover(options: {
     let exportPath: string | null = null;
     if (before.jevRows !== null) {
       NodeFS.mkdirSync(options.exportDir, { recursive: true });
-      exportPath = NodePath.join(options.exportDir, "jev_execution_requests.json");
-      NodeFS.writeFileSync(exportPath, JSON.stringify(before.jevRows, null, 2));
+      const stamp = new Date().toISOString().replaceAll(":", "-");
+      exportPath = NodePath.join(options.exportDir, `jev_execution_requests-${stamp}.json`);
+      // "wx" fails instead of replacing an existing export.
+      NodeFS.writeFileSync(exportPath, JSON.stringify(before.jevRows, null, 2), { flag: "wx" });
     }
     const report: Report = {
       apply: options.apply,
