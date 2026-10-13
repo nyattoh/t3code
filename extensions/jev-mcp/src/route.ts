@@ -153,8 +153,8 @@ export function httpJevCall(
   readKey: () => string | undefined = () => process.env.TYPESAFE_API_KEY,
 ): JevCall {
   return async (body, signal) => {
-    const key = readKey();
-    if (!key?.trim()) throw new JevError("missing-key");
+    const key = readKey()?.trim();
+    if (!key) throw new JevError("missing-key");
     let response: Response;
     try {
       response = await fetcher(JEV_ENDPOINT, {

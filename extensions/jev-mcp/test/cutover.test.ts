@@ -57,7 +57,7 @@ NodeTest.test("dry run reports the plan, exports rows, and changes nothing", () 
   const report = cutover({ ...fixture, apply: false });
   NodeAssert.equal(report.statements.length, 6);
   NodeAssert.deepEqual(history(fixture.dbPath), forkHistory);
-  NodeAssert.equal(JSON.parse(NodeFS.readFileSync(report.exportPath, "utf8")).length, 2);
+  NodeAssert.equal(JSON.parse(NodeFS.readFileSync(report.exportPath!, "utf8")).length, 2);
   NodeAssert.equal(NodeFS.existsSync(fixture.backupDir), false);
 });
 
@@ -73,23 +73,20 @@ NodeTest.test(
     NodeAssert.equal(report.after?.hasDeliveries, true);
     NodeAssert.equal(report.after?.jevRows, null);
     NodeAssert.deepEqual(history(NodePath.join(fixture.backupDir, "statev2.sqlite")), forkHistory);
-    NodeAssert.deepEqual(JSON.parse(NodeFS.readFileSync(report.exportPath, "utf8")), [
+    NodeAssert.deepEqual(JSON.parse(NodeFS.readFileSync(report.exportPath!, "utf8")), [
       { command_id: "cmd-0", request_digest: "digest-0" },
     ]);
   },
 );
 
-NodeTest.test("a second apply is a no-op", () => {
-  const fixture = forkDb();
-  cutover({ ...fixture, apply: true });
-  const again = cutover({
-    ...fixture,
-    exportDir: NodePath.join(fixture.dir, "export2"),
-    backupDir: undefined,
-    apply: true,
-  });
+NodeTest.test("a second apply is a no-op and keeps the first export", () => {
+  const fixture = forkDb({ jevRows: 2 });
+  const first = cutover({ ...fixture, apply: true });
+  const again = cutover({ ...fixture, backupDir: undefined, apply: true });
   NodeAssert.deepEqual(again.statements, []);
   NodeAssert.equal(again.after, undefined);
+  NodeAssert.equal(again.exportPath, null);
+  NodeAssert.equal(JSON.parse(NodeFS.readFileSync(first.exportPath!, "utf8")).length, 2);
 });
 
 NodeTest.test("refuses an unrecognized history and leaves it untouched", () => {
