@@ -89,6 +89,14 @@ NodeTest.test("a second apply is a no-op and keeps the first export", () => {
   NodeAssert.equal(JSON.parse(NodeFS.readFileSync(first.exportPath!, "utf8")).length, 2);
 });
 
+NodeTest.test("each dry run writes its own export file", () => {
+  const fixture = forkDb({ jevRows: 1 });
+  const first = cutover({ ...fixture, apply: false });
+  const second = cutover({ ...fixture, apply: false });
+  NodeAssert.notEqual(first.exportPath, second.exportPath);
+  NodeAssert.equal(NodeFS.readdirSync(fixture.exportDir).length, 2);
+});
+
 NodeTest.test("refuses an unrecognized history and leaves it untouched", () => {
   const odd = forkHistory.map(([id, name]) => [id, id === 58 ? "SomethingElse" : name] as const);
   const fixture = forkDb({ history: odd });
