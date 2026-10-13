@@ -1,0 +1,17 @@
+{
+  "name": "jev-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Jev model routing as a standalone MCP server for T3 Code. Lives outside T3's workspace and database.",
+  "bin": {
+    "jev-mcp": "./src/main.ts"
+  },
+  "type": "module",
+  "scripts": {
+    "start": "node src/main.ts",
+    "test": "node --test test/*.test.ts"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}
