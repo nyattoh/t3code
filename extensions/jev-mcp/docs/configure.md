@@ -43,3 +43,36 @@ claude mcp add --scope user jev -- node D:\develop\works\t3code\extensions\jev-m
 If the Claude provider instance sets `CLAUDE_CONFIG_DIR`, run the command with the same `CLAUDE_CONFIG_DIR` so the entry lands in that directory. Check with `claude mcp list`.
 
 This follows from the adapter source and the SDK documentation. It has not yet been observed in a running T3 Claude thread. To confirm, open a Claude thread in T3 and ask it to list its MCP tools. `jev_route` should appear.
+
+## T3 Code Desktop with the WSL backend
+
+When T3 Desktop runs its server inside WSL, providers run in the distro and the Windows setup above does not apply:
+
+- The Desktop strips `T3CODE_HOME` from the environment it hands to `wsl.exe` and forwards only an allowlist (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, telemetry variables). `TYPESAFE_API_KEY` is not on it. See `WSL_FORWARDED_ENV_NAMES` in `apps/desktop/src/backend/DesktopBackendConfiguration.ts`.
+- Codex and Claude read their config from the distro's home (`~/.codex/config.toml`, `~/.claude.json`), not from `%USERPROFILE%`.
+- `node` must be Node 24 or newer inside the distro, and paths must be Linux paths.
+
+Workaround:
+
+1. Forward the key with the Windows user variable `WSLENV`. The Desktop keeps the user's `WSLENV` and appends its own names to it:
+
+   ```powershell
+   [Environment]::SetEnvironmentVariable('WSLENV', 'TYPESAFE_API_KEY', 'User')
+   ```
+
+   If `WSLENV` already has entries, append `:TYPESAFE_API_KEY` instead of replacing them. Restart T3 Code afterwards.
+
+2. In the distro, register the server with an explicit store path, because `T3CODE_HOME` does not arrive:
+
+   ```toml
+   [mcp_servers.jev]
+   command = "node"
+   args = ["/mnt/d/develop/works/t3code-jev-detached/extensions/jev-mcp/src/main.ts", "--db", "/home/<you>/.t3/jev/jev.sqlite"]
+   env_vars = ["TYPESAFE_API_KEY"]
+   ```
+
+   ```sh
+   claude mcp add --scope user jev -- node /mnt/d/develop/works/t3code-jev-detached/extensions/jev-mcp/src/main.ts --db ~/.t3/jev/jev.sqlite
+   ```
+
+   A store on `/mnt/d` works, but SQLite locking across the 9P mount is slower and less reliable than on the distro's own filesystem, so keep the store under the distro home.
