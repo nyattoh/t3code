@@ -1,3 +1,4 @@
+import * as NodeCrypto from "node:crypto";
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
@@ -40,15 +41,20 @@ export class JevStore {
         request_digest TEXT NOT NULL,
         decision_json TEXT,
         claim_expires_at INTEGER,
+        claim_token TEXT,
         created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
       )
     `);
-    const columns = this.#db
-      .prepare("PRAGMA table_info(jev_requests)")
-      .all()
-      .map((c) => String(c.name));
-    if (!columns.includes("claim_expires_at"))
+    const columns = new Set(
+      this.#db
+        .prepare("PRAGMA table_info(jev_requests)")
+        .all()
+        .map((c) => String(c.name)),
+    );
+    if (!columns.has("claim_expires_at"))
       this.#db.exec("ALTER TABLE jev_requests ADD COLUMN claim_expires_at INTEGER");
+    if (!columns.has("claim_token"))
+      this.#db.exec("ALTER TABLE jev_requests ADD COLUMN claim_token TEXT");
   }
 
   /**
@@ -63,7 +69,11 @@ export class JevStore {
     requestDigest: string,
     now: number,
     ttlMs: number,
-  ): { readonly state: "claimed" | "pending" | "settled"; readonly row: StoredRequest } {
+  ): {
+    readonly state: "claimed" | "pending" | "settled";
+    readonly row: StoredRequest;
+    readonly token: string | null;
+  } {
     this.#db.exec("BEGIN IMMEDIATE");
     try {
       this.#db
@@ -74,34 +84,38 @@ export class JevStore {
         .prepare("SELECT claim_expires_at AS expires FROM jev_requests WHERE request_id = ?")
         .get(requestId) as { expires: number | null };
       let state: "claimed" | "pending" | "settled";
+      let token: string | null = null;
       if (row.decision !== null || row.requestDigest !== requestDigest) state = "settled";
       else if (expires !== null && expires > now) state = "pending";
       else {
         this.#db
-          .prepare("UPDATE jev_requests SET claim_expires_at = ? WHERE request_id = ?")
-          .run(now + ttlMs, requestId);
+          .prepare(
+            "UPDATE jev_requests SET claim_expires_at = ?, claim_token = ? WHERE request_id = ?",
+          )
+          .run(now + ttlMs, (token = NodeCrypto.randomUUID()), requestId);
         state = "claimed";
       }
       this.#db.exec("COMMIT");
-      return { state, row };
+      return { state, row, token };
     } catch (error) {
       this.#db.exec("ROLLBACK");
       throw error;
     }
   }
 
-  release(requestId: string): void {
+  /** Releases only this caller's claim: an expired claim may since belong to someone else. */
+  release(requestId: string, token: string): void {
     this.#db
       .prepare(
-        "UPDATE jev_requests SET claim_expires_at = NULL WHERE request_id = ? AND decision_json IS NULL",
+        "UPDATE jev_requests SET claim_expires_at = NULL, claim_token = NULL WHERE request_id = ? AND claim_token = ? AND decision_json IS NULL",
       )
-      .run(requestId);
+      .run(requestId, token);
   }
 
   complete(requestId: string, decision: Decision): void {
     this.#db
       .prepare(
-        "UPDATE jev_requests SET decision_json = ?, claim_expires_at = NULL WHERE request_id = ? AND decision_json IS NULL",
+        "UPDATE jev_requests SET decision_json = ?, claim_expires_at = NULL, claim_token = NULL WHERE request_id = ? AND decision_json IS NULL",
       )
       .run(JSON.stringify(decision), requestId);
   }
