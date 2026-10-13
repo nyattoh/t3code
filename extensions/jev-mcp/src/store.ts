@@ -33,6 +33,7 @@ export class JevStore {
     if (path !== ":memory:") NodeFS.mkdirSync(NodePath.dirname(path), { recursive: true });
     this.#db = new NodeSqlite.DatabaseSync(path);
     this.#db.exec(`
+      PRAGMA busy_timeout = 5000;
       PRAGMA journal_mode = WAL;
       CREATE TABLE IF NOT EXISTS jev_requests (
         request_id TEXT PRIMARY KEY NOT NULL,
