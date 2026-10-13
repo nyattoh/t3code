@@ -309,3 +309,15 @@ NodeTest.test("answers non-object JSON with Invalid Request and keeps serving", 
     [-32600, -32600, -32600, 7],
   );
 });
+
+NodeTest.test("a late release does not drop a claim another caller took over", () => {
+  const store = new JevStore(":memory:");
+  const first = store.claim("req-x", "d", 0, 10);
+  const second = store.claim("req-x", "d", 100, 10_000);
+  NodeAssert.equal(first.state, "claimed");
+  NodeAssert.equal(second.state, "claimed");
+  store.release("req-x", first.token!);
+  NodeAssert.equal(store.claim("req-x", "d", 200, 10_000).state, "pending");
+  store.release("req-x", second.token!);
+  NodeAssert.equal(store.claim("req-x", "d", 300, 10_000).state, "claimed");
+});
