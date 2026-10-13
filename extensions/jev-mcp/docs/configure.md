@@ -21,6 +21,8 @@ T3 passes its own server as a `mcp_servers` config override on every thread. Cod
 
 Check the entry with `codex mcp get jev`.
 
+Codex asks for approval before each MCP tool call. Under `approval_policy = "never"` (for example `codex exec`) the call is refused with `MCP tool call requires approval`. Add `default_tools_approval_mode = "approve"` to `[mcp_servers.jev]` to allow `jev_route` without a prompt. With codex-cli 0.162.1 and that setting, `codex exec` called `jev/jev_route` and returned Jev's answer.
+
 ### Benchmark ledger
 
 The fork hardcoded a `bench-ledger` server behind `T3_BENCH_LEDGER_*` variables. Declare it the same way instead:
